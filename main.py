@@ -1,6 +1,7 @@
 import sys
 import json
 import os
+import traceback
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, 
                              QHBoxLayout, QWidget, QPushButton, QLabel, 
                              QFileDialog, QTextEdit, QMessageBox, QScrollArea,
@@ -9,6 +10,9 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout,
                              QListWidgetItem)
 from PyQt6.QtCore import Qt, pyqtSignal, QRect, QPoint, QSize, QTimer
 from PyQt6.QtGui import QFont, QPalette, QPixmap, QPainter, QPen, QColor, QBrush, QPolygon
+
+# 全局常量：像素到毫米的转换比例
+PER_PIXEL_MM = 127.0 / 9570
 
 
 class ClassManager:
@@ -66,6 +70,8 @@ class ClassManager:
 class ImageLabel(QLabel):
     """自定义图片标签，支持绘制缺陷区域"""
     region_clicked = pyqtSignal(int)  # 发送被点击区域的信号
+    new_region_created = pyqtSignal(int, int, int, int)  # 发送新建区域的信号 (x, y, width, height)
+    region_unselected = pyqtSignal()  # 发送取消选中区域的信号
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -75,10 +81,24 @@ class ImageLabel(QLabel):
         self.scale_factor = 1.0
         self.zoom_factor = 1.0  # 用户缩放倍数
         self.selected_region_index = -1  # 当前选中的区域索引
+        self.regions_visible = True  # 区域框是否可见，默认为True
         self.setMinimumSize(400, 300)
         self.setStyleSheet("border: 1px solid gray;")
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)  # 接受键盘焦点
         self.setScaledContents(False)  # 不自动缩放内容
+        
+        # 添加缺陷模式相关变量
+        self.add_defect_mode = False
+        self.drawing = False
+        self.start_point = QPoint()
+        self.end_point = QPoint()
+        self.current_rect = QRect()
+        
+        # 图片拖动相关变量
+        self.panning = False
+        self.pan_start_point = QPoint()
+        self.scroll_area = None  # 滚动区域的引用
+        self.click_threshold = 5  # 点击和拖动的阈值（像素）
         
     def set_image_and_regions(self, image_path, regions, class_manager):
         """设置图片和缺陷区域"""
@@ -172,7 +192,8 @@ class ImageLabel(QLabel):
     
     def draw_regions(self, pixmap):
         """在图片上绘制缺陷区域"""
-        if not self.regions or not self.class_manager:
+        # 如果区域不可见，直接返回原图
+        if not self.regions_visible or not self.regions or not self.class_manager:
             return pixmap
         
         painter = QPainter(pixmap)
@@ -203,7 +224,7 @@ class ImageLabel(QLabel):
                 # 已修改：使用虚线边框
                 pen_style = Qt.PenStyle.DashLine
             elif modified_status == 2:
-                # 待确认：使用点线边框
+                # 已添加：使用点线边框
                 pen_style = Qt.PenStyle.DotLine
             else:
                 # 未修改：使用实线边框
@@ -253,7 +274,7 @@ class ImageLabel(QLabel):
                 if modified_status == 1:
                     status_suffix = " [修改]"
                 elif modified_status == 2:
-                    status_suffix = " [待确认]"
+                    status_suffix = " [已添加]"
                 
                 # 为选中的区域添加特殊标识
                 selection_prefix = "★ " if is_selected else ""
@@ -271,7 +292,7 @@ class ImageLabel(QLabel):
                 elif modified_status == 1:
                     bg_color = QColor(255, 255, 0, 200)  # 黄色背景表示已修改
                 elif modified_status == 2:
-                    bg_color = QColor(255, 165, 0, 200)  # 橙色背景表示待确认
+                    bg_color = QColor(255, 165, 0, 200)  # 橙色背景表示已添加
                 else:
                     bg_color = QColor(255, 255, 255, 200)  # 白色背景表示未修改
                 
@@ -286,6 +307,43 @@ class ImageLabel(QLabel):
                 # 绘制文本
                 painter.setPen(QPen(color, 1))
                 painter.drawText(text_bg_rect, Qt.AlignmentFlag.AlignCenter, text)
+        
+        # 绘制正在拖拽的临时矩形（如果在添加缺陷模式中）
+        if self.add_defect_mode and self.drawing and not self.current_rect.isEmpty():
+            # 使用虚线红色边框绘制临时矩形
+            temp_pen = QPen(QColor(255, 0, 0), 2, Qt.PenStyle.DashLine)
+            painter.setPen(temp_pen)
+            painter.drawRect(self.current_rect)
+            
+            # 在矩形中心显示大小信息
+            center_x = self.current_rect.center().x()
+            center_y = self.current_rect.center().y()
+            size_text = f"{self.current_rect.width()}×{self.current_rect.height()}"
+            
+            # 设置文字样式
+            font = QFont()
+            font.setPointSize(10)
+            font.setBold(True)
+            painter.setFont(font)
+            
+            # 计算文字背景
+            text_metrics = painter.fontMetrics()
+            text_rect = text_metrics.boundingRect(size_text)
+            text_bg_rect = QRect(
+                center_x - text_rect.width()//2 - 5,
+                center_y - text_rect.height()//2 - 2,
+                text_rect.width() + 10,
+                text_rect.height() + 4
+            )
+            
+            # 绘制半透明背景
+            painter.fillRect(text_bg_rect, QColor(255, 255, 255, 180))
+            painter.setPen(QPen(QColor(0, 0, 0), 1))
+            painter.drawRect(text_bg_rect)
+            
+            # 绘制文字
+            painter.setPen(QPen(QColor(255, 0, 0), 1))
+            painter.drawText(text_bg_rect, Qt.AlignmentFlag.AlignCenter, size_text)
         
         painter.end()
         return pixmap
@@ -366,24 +424,127 @@ class ImageLabel(QLabel):
             else:
                 print("未找到滚动区域")
     
+    def set_scroll_area(self, scroll_area):
+        """设置滚动区域的引用，用于拖动移动"""
+        self.scroll_area = scroll_area
+    
+    def set_add_defect_mode(self, enabled):
+        """设置添加缺陷模式"""
+        self.add_defect_mode = enabled
+        if enabled:
+            self.setCursor(Qt.CursorShape.CrossCursor)  # 设置十字光标
+        else:
+            self.setCursor(Qt.CursorShape.ArrowCursor)  # 恢复正常光标
+            self.drawing = False
+            self.update_display()  # 刷新显示以清除临时绘制的矩形
+    
     def mousePressEvent(self, event):
         """处理鼠标点击事件"""
-        if event.button() == Qt.MouseButton.LeftButton and self.regions:
-            click_pos = event.position().toPoint()
-            
-            # 查找被点击的区域
-            for i, region in enumerate(self.regions):
-                x = int(region.get('x', 0) * self.scale_factor)
-                y = int(region.get('y', 0) * self.scale_factor)
-                width = int(region.get('width', 0) * self.scale_factor)
-                height = int(region.get('height', 0) * self.scale_factor)
-                
-                if (x <= click_pos.x() <= x + width and 
-                    y <= click_pos.y() <= y + height):
-                    self.region_clicked.emit(i)
-                    break
+        click_pos = event.position().toPoint()
+        
+        if event.button() == Qt.MouseButton.RightButton and self.add_defect_mode:
+            # 右键拖拽添加缺陷模式
+            self.drawing = True
+            self.start_point = click_pos
+            self.end_point = click_pos
+            self.current_rect = QRect()
+        elif event.button() == Qt.MouseButton.LeftButton:
+            # 左键处理：记录起始点，等待判断是点击还是拖动
+            self.pan_start_point = click_pos
+            self.panning = False  # 初始化为false，等待移动判断
         
         super().mousePressEvent(event)
+    
+    def mouseMoveEvent(self, event):
+        """处理鼠标移动事件"""
+        current_pos = event.position().toPoint()
+        
+        if self.drawing and self.add_defect_mode:
+            # 添加缺陷模式下的拖拽
+            self.end_point = current_pos
+            # 计算当前矩形
+            self.current_rect = QRect(self.start_point, self.end_point).normalized()
+            self.update()  # 重绘界面
+        elif event.buttons() & Qt.MouseButton.LeftButton:
+            # 左键拖动处理
+            if not self.panning:
+                # 检查是否超过点击阈值，如果是则开始拖动
+                distance = (current_pos - self.pan_start_point).manhattanLength()
+                if distance > self.click_threshold:
+                    self.panning = True
+                    self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            
+            if self.panning and self.scroll_area:
+                # 计算移动偏移量
+                delta = current_pos - self.pan_start_point
+                
+                # 获取当前滚动条位置
+                h_scroll = self.scroll_area.horizontalScrollBar()
+                v_scroll = self.scroll_area.verticalScrollBar()
+                
+                # 移动滚动条（注意方向相反）
+                h_scroll.setValue(h_scroll.value() - delta.x())
+                v_scroll.setValue(v_scroll.value() - delta.y())
+                
+                # 更新起始点
+                self.pan_start_point = current_pos
+        
+        super().mouseMoveEvent(event)
+    
+    def mouseReleaseEvent(self, event):
+        """处理鼠标释放事件"""
+        if event.button() == Qt.MouseButton.RightButton and self.drawing and self.add_defect_mode:
+            self.drawing = False
+            self.end_point = event.position().toPoint()
+            
+            # 计算最终矩形
+            final_rect = QRect(self.start_point, self.end_point).normalized()
+            
+            # 检查矩形大小是否合理（至少10x10像素）
+            if final_rect.width() >= 10 and final_rect.height() >= 10:
+                # 发送新区域创建信号
+                self.new_region_created.emit(
+                    final_rect.x(), 
+                    final_rect.y(), 
+                    final_rect.width(), 
+                    final_rect.height()
+                )
+            
+            # 清除临时矩形
+            self.current_rect = QRect()
+            self.update()
+        elif event.button() == Qt.MouseButton.LeftButton:
+            # 左键释放处理
+            if self.panning:
+                # 结束拖动
+                self.panning = False
+                self.setCursor(Qt.CursorShape.ArrowCursor)
+            else:
+                # 这是一个点击操作，处理区域选择
+                if self.regions:
+                    click_pos = event.position().toPoint()
+                    region_found = False
+                    # 查找被点击的区域
+                    for i, region in enumerate(self.regions):
+                        x = int(region.get('x', 0) * self.scale_factor)
+                        y = int(region.get('y', 0) * self.scale_factor)
+                        width = int(region.get('width', 0) * self.scale_factor)
+                        height = int(region.get('height', 0) * self.scale_factor)
+                        
+                        if (x <= click_pos.x() <= x + width and 
+                            y <= click_pos.y() <= y + height):
+                            self.region_clicked.emit(i)
+                            region_found = True
+                            break
+                    
+                    # 如果没有点击到任何区域，取消选中
+                    if not region_found:
+                        self.region_unselected.emit()
+                else:
+                    # 没有区域时，直接取消选中
+                    self.region_unselected.emit()
+        
+        super().mouseReleaseEvent(event)
     
     def resizeEvent(self, event):
         """处理窗口大小改变事件"""
@@ -391,12 +552,35 @@ class ImageLabel(QLabel):
         # 移除自动更新显示，避免不必要的重复缩放
     
     def wheelEvent(self, event):
-        """处理鼠标滚轮事件进行缩放"""
-        if self.original_pixmap:
-            # 获取滚轮滚动方向
-            delta = event.angleDelta().y()
+        """处理鼠标滚轮事件进行缩放，以鼠标位置为中心"""
+        if self.original_pixmap and self.scroll_area:
+            # 获取鼠标在ImageLabel上的位置
+            mouse_pos = event.position().toPoint()
             
-            # 缩放步长
+            # 获取滚动条当前值
+            h_scrollbar = self.scroll_area.horizontalScrollBar()
+            v_scrollbar = self.scroll_area.verticalScrollBar()
+            old_h_value = h_scrollbar.value()
+            old_v_value = v_scrollbar.value()
+            
+            # 计算鼠标在完整图片中的绝对坐标
+            old_size = self.size()
+            mouse_x_in_image = mouse_pos.x()
+            mouse_y_in_image = mouse_pos.y()
+            
+            # 计算鼠标在图片中的相对位置（0-1之间）
+            if old_size.width() > 0 and old_size.height() > 0:
+                rel_x = mouse_x_in_image / old_size.width()
+                rel_y = mouse_y_in_image / old_size.height()
+            else:
+                rel_x = 0.5
+                rel_y = 0.5
+            
+            # 保存旧的缩放因子
+            old_zoom_factor = self.zoom_factor
+            
+            # 获取滚轮滚动方向并调整缩放
+            delta = event.angleDelta().y()
             zoom_step = 0.1
             
             if delta > 0:
@@ -409,29 +593,109 @@ class ImageLabel(QLabel):
             # 限制缩放范围
             self.zoom_factor = max(0.1, min(5.0, self.zoom_factor))
             
+            # 如果缩放因子没有实际改变，直接返回
+            if abs(self.zoom_factor - old_zoom_factor) < 0.001:
+                return
+            
+            # 更新显示
             self.update_display()
+            
+            # 计算缩放后鼠标应该在图片中的新位置
+            new_size = self.size()
+            new_mouse_x_in_image = rel_x * new_size.width()
+            new_mouse_y_in_image = rel_y * new_size.height()
+            
+            # 计算需要调整的滚动量，使鼠标位置保持在视窗中的相同位置
+            scroll_adjust_x = new_mouse_x_in_image - mouse_x_in_image
+            scroll_adjust_y = new_mouse_y_in_image - mouse_y_in_image
+            
+            # 设置新的滚动位置
+            new_h_value = old_h_value + scroll_adjust_x
+            new_v_value = old_v_value + scroll_adjust_y
+            
+            h_scrollbar.setValue(int(new_h_value))
+            v_scrollbar.setValue(int(new_v_value))
     
     def keyPressEvent(self, event):
         """处理键盘事件"""
         if self.original_pixmap:
             if event.key() == Qt.Key.Key_Plus or event.key() == Qt.Key.Key_Equal:
-                # + 键放大
-                self.zoom_factor *= 1.1
-                self.zoom_factor = min(5.0, self.zoom_factor)
-                self.update_display()
+                # + 键放大 - 如果有父窗口且支持缩放方法，使用父窗口的方法
+                if hasattr(self, 'parent_dialog') and hasattr(self.parent_dialog, 'zoom_in'):
+                    self.parent_dialog.zoom_in()
+                else:
+                    # 回退到简单缩放
+                    self.zoom_factor *= 1.1
+                    self.zoom_factor = min(5.0, self.zoom_factor)
+                    self.update_display()
             elif event.key() == Qt.Key.Key_Minus:
                 # - 键缩小
-                self.zoom_factor *= 0.9
-                self.zoom_factor = max(0.1, self.zoom_factor)
-                self.update_display()
+                if hasattr(self, 'parent_dialog') and hasattr(self.parent_dialog, 'zoom_out'):
+                    self.parent_dialog.zoom_out()
+                else:
+                    # 回退到简单缩放
+                    self.zoom_factor *= 0.9
+                    self.zoom_factor = max(0.1, self.zoom_factor)
+                    self.update_display()
             elif event.key() == Qt.Key.Key_0:
                 # 0 键重置缩放
-                self.zoom_factor = 1.0
-                self.update_display()
+                if hasattr(self, 'parent_dialog') and hasattr(self.parent_dialog, 'zoom_reset'):
+                    self.parent_dialog.zoom_reset()
+                else:
+                    # 回退到简单缩放
+                    self.zoom_factor = 1.0
+                    self.update_display()
         
         super().keyPressEvent(event)
-
-
+    
+    def paintEvent(self, event):
+        """重写绘制事件，显示正在拖拽的矩形"""
+        super().paintEvent(event)
+        
+        # 如果在添加缺陷模式中且正在拖拽，绘制临时矩形
+        if self.add_defect_mode and self.drawing and not self.current_rect.isEmpty():
+            painter = QPainter(self)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            
+            # 设置虚线红色边框
+            pen = QPen(QColor(255, 0, 0), 2, Qt.PenStyle.DashLine)
+            painter.setPen(pen)
+            
+            # 绘制矩形
+            painter.drawRect(self.current_rect)
+            
+            # 在矩形中心显示大小信息
+            if self.current_rect.width() > 20 and self.current_rect.height() > 20:
+                center_x = self.current_rect.center().x()
+                center_y = self.current_rect.center().y()
+                size_text = f"{self.current_rect.width()}×{self.current_rect.height()}"
+                
+                # 设置文字样式
+                font = QFont()
+                font.setPointSize(10)
+                font.setBold(True)
+                painter.setFont(font)
+                
+                # 计算文字背景
+                text_metrics = painter.fontMetrics()
+                text_rect = text_metrics.boundingRect(size_text)
+                text_bg_rect = QRect(
+                    center_x - text_rect.width()//2 - 5,
+                    center_y - text_rect.height()//2 - 2,
+                    text_rect.width() + 10,
+                    text_rect.height() + 4
+                )
+                
+                # 绘制半透明白色背景
+                painter.fillRect(text_bg_rect, QColor(255, 255, 255, 180))
+                painter.setPen(QPen(QColor(0, 0, 0), 1))
+                painter.drawRect(text_bg_rect)
+                
+                # 绘制文字
+                painter.setPen(QPen(QColor(255, 0, 0), 1))
+                painter.drawText(text_bg_rect, Qt.AlignmentFlag.AlignCenter, size_text)
+            
+            painter.end()
 
 class DetailDialog(QWidget):
     """详细标注界面"""
@@ -442,6 +706,8 @@ class DetailDialog(QWidget):
         self.current_region_index = -1
         self.regions_modified = False
         self.parent_app = parent  # 保存父应用的引用
+        self.regions_visible = True  # 区域框是否可见，默认为True
+        self.add_defect_mode = False  # 添加缺陷模式标志
         
         # 初始化类别管理器，使用相对路径
         try:
@@ -502,15 +768,21 @@ class DetailDialog(QWidget):
             zoom_reset_btn = QPushButton("重置 (0)")
             zoom_reset_btn.clicked.connect(self.zoom_reset)
             
+            # 添加切换区域框显示的按钮
+            self.toggle_regions_btn = QPushButton("隐藏区域框")
+            self.toggle_regions_btn.clicked.connect(self.toggle_regions_visibility)
+            self.toggle_regions_btn.setStyleSheet("QPushButton { background-color: #FF9800; color: white; }")
+            
             self.zoom_label = QLabel("缩放: 100%")
             
             # 添加使用说明
-            help_label = QLabel("提示: 鼠标滚轮缩放，+/- 键缩放，0 键重置")
+            help_label = QLabel("提示: 鼠标滚轮缩放，+/- 键缩放，0 键重置，左键拖动移动图片")
             help_label.setStyleSheet("color: gray; font-size: 10px;")
             
             zoom_layout.addWidget(zoom_in_btn)
             zoom_layout.addWidget(zoom_out_btn)
             zoom_layout.addWidget(zoom_reset_btn)
+            zoom_layout.addWidget(self.toggle_regions_btn)  # 添加切换按钮
             zoom_layout.addWidget(self.zoom_label)
             zoom_layout.addStretch()
             zoom_layout.addWidget(help_label)
@@ -530,9 +802,14 @@ class DetailDialog(QWidget):
             # 图片标签
             self.image_label = ImageLabel()
             self.image_label.region_clicked.connect(self.on_region_clicked)
+            self.image_label.new_region_created.connect(self.add_new_defect_region)
+            self.image_label.region_unselected.connect(self.on_region_unselected)
             
             # 设置DetailDialog的引用，方便更新缩放标签
             self.image_label.parent_dialog = self
+            
+            # 设置区域框的初始可见性
+            self.image_label.regions_visible = self.regions_visible
             
             # 设置图片和区域
             self.image_label.set_image_and_regions(
@@ -548,6 +825,9 @@ class DetailDialog(QWidget):
             scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
             scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
             scroll_area.setMinimumSize(600, 400)
+            
+            # 设置滚动区域引用，用于拖动移动
+            self.image_label.set_scroll_area(scroll_area)
             
             image_layout.addWidget(scroll_area)
             main_layout.addWidget(image_frame)
@@ -619,7 +899,7 @@ class DetailDialog(QWidget):
         list_layout.addWidget(instruction_label)
         
         # 添加修改状态的视觉说明
-        status_legend = QLabel("颜色说明：白色=未修改，黄色=已修改，橙色=待确认")
+        status_legend = QLabel("颜色说明：白色=未修改，黄色=已修改，橙色=已添加")
         status_legend.setStyleSheet("color: gray; font-size: 9px; font-style: italic;")
         list_layout.addWidget(status_legend)
         
@@ -630,33 +910,6 @@ class DetailDialog(QWidget):
         self.update_region_list()
         
         list_layout.addWidget(self.region_list_widget)
-        
-        # 添加导航按钮
-        nav_layout = QHBoxLayout()
-        
-        self.prev_btn = QPushButton("上一个 (←)")
-        self.prev_btn.clicked.connect(self.go_to_previous_region)
-        self.prev_btn.setEnabled(False)
-        nav_layout.addWidget(self.prev_btn)
-        
-        self.next_btn = QPushButton("下一个 (→)")
-        self.next_btn.clicked.connect(self.go_to_next_region)
-        self.next_btn.setEnabled(False)
-        nav_layout.addWidget(self.next_btn)
-        
-        # 添加快速确认按钮
-        self.quick_confirm_btn = QPushButton("确认当前区域 (空格)")
-        self.quick_confirm_btn.clicked.connect(self.quick_confirm_current_region)
-        self.quick_confirm_btn.setEnabled(False)
-        self.quick_confirm_btn.setStyleSheet("QPushButton { background-color: #2196F3; color: white; }")
-        nav_layout.addWidget(self.quick_confirm_btn)
-        
-        list_layout.addLayout(nav_layout)
-        
-        # 添加快捷键说明
-        shortcut_help = QLabel("快捷键：← ↑ (上一个)  → ↓ (下一个)  空格 (确认)  ESC (关闭)")
-        shortcut_help.setStyleSheet("color: gray; font-size: 9px; font-style: italic; margin-top: 5px;")
-        list_layout.addWidget(shortcut_help)
         parent_layout.addWidget(list_group)
     
     def create_region_navigation_group(self, parent_layout):
@@ -679,10 +932,17 @@ class DetailDialog(QWidget):
         self.next_region_btn.setEnabled(False)
         nav_button_layout.addWidget(self.next_region_btn)
         
+        # 添加快速确认按钮
+        self.quick_confirm_btn = QPushButton("确认当前区域 (空格)")
+        self.quick_confirm_btn.clicked.connect(self.quick_confirm_current_region)
+        self.quick_confirm_btn.setEnabled(False)
+        self.quick_confirm_btn.setStyleSheet("QPushButton { background-color: #2196F3; color: white; }")
+        nav_button_layout.addWidget(self.quick_confirm_btn)
+
         nav_layout.addLayout(nav_button_layout)
         
         # 添加快捷键提示
-        shortcut_label = QLabel("快捷键: ←/→ 方向键导航, 空格键快速确认")
+        shortcut_label = QLabel("快捷键: ←/→ 方向键导航, 空格键快速确认, Delete键删除, 右键拖拽添加缺陷, 左键拖动移动图片")
         shortcut_label.setStyleSheet("color: gray; font-size: 9px;")
         nav_layout.addWidget(shortcut_label)
         
@@ -718,31 +978,23 @@ class DetailDialog(QWidget):
         modify_layout.addWidget(self.modify_spin)
         
         # 添加修改状态说明
-        status_help = QLabel("(0:未修改, 1:已修改, 2:待确认)")
+        status_help = QLabel("(0:未修改, 1:已修改, 2:已添加)")
         status_help.setStyleSheet("color: gray; font-size: 10px;")
         modify_layout.addWidget(status_help)
         
         edit_layout.addLayout(modify_layout)
         
-        # 位置和大小信息（只读）
-        pos_group = QGroupBox("位置和大小")
+        # 大小信息（只读）
+        pos_group = QGroupBox("大小信息")
         pos_layout = QGridLayout(pos_group)
         
-        pos_layout.addWidget(QLabel("X:"), 0, 0)
-        self.x_label = QLabel("0")
-        pos_layout.addWidget(self.x_label, 0, 1)
-        
-        pos_layout.addWidget(QLabel("Y:"), 0, 2)
-        self.y_label = QLabel("0")
-        pos_layout.addWidget(self.y_label, 0, 3)
-        
-        pos_layout.addWidget(QLabel("宽度:"), 1, 0)
+        pos_layout.addWidget(QLabel("宽度(mm):"), 0, 0)
         self.width_label = QLabel("0")
-        pos_layout.addWidget(self.width_label, 1, 1)
+        pos_layout.addWidget(self.width_label, 0, 1)
         
-        pos_layout.addWidget(QLabel("高度:"), 1, 2)
+        pos_layout.addWidget(QLabel("高度(mm):"), 0, 2)
         self.height_label = QLabel("0")
-        pos_layout.addWidget(self.height_label, 1, 3)
+        pos_layout.addWidget(self.height_label, 0, 3)
         
         edit_layout.addWidget(pos_group)
         
@@ -759,18 +1011,47 @@ class DetailDialog(QWidget):
     
     def create_action_buttons(self, parent_layout):
         """创建操作按钮"""
-        button_layout = QHBoxLayout()
+        button_layout = QVBoxLayout()
+        
+        # 第一行按钮
+        first_row_layout = QHBoxLayout()
+        
+        # 添加缺陷按钮
+        self.add_defect_btn = QPushButton("添加缺陷")
+        self.add_defect_btn.clicked.connect(self.toggle_add_defect_mode)
+        self.add_defect_btn.setStyleSheet("QPushButton { background-color: #FF5722; color: white; }")
+        first_row_layout.addWidget(self.add_defect_btn)
+        
+        # 删除区域按钮
+        self.delete_region_btn = QPushButton("删除选中区域")
+        self.delete_region_btn.clicked.connect(self.delete_current_region)
+        self.delete_region_btn.setStyleSheet("QPushButton { background-color: #f44336; color: white; }")
+        self.delete_region_btn.setEnabled(False)  # 初始禁用
+        first_row_layout.addWidget(self.delete_region_btn)
+        
+        button_layout.addLayout(first_row_layout)
+        
+        # 第二行按钮
+        second_row_layout = QHBoxLayout()
         
         # 保存按钮
         save_btn = QPushButton("保存修改")
         save_btn.clicked.connect(self.save_changes)
         save_btn.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; }")
-        button_layout.addWidget(save_btn)
+        second_row_layout.addWidget(save_btn)
         
         # 取消按钮
         cancel_btn = QPushButton("取消")
         cancel_btn.clicked.connect(self.close)
-        button_layout.addWidget(cancel_btn)
+        second_row_layout.addWidget(cancel_btn)
+        
+        button_layout.addLayout(second_row_layout)
+        
+        # 添加提示标签
+        self.add_defect_hint = QLabel("提示: 点击'添加缺陷'后，在图片上右键拖拽框选区域")
+        self.add_defect_hint.setStyleSheet("color: gray; font-size: 10px; font-style: italic;")
+        self.add_defect_hint.setVisible(False)
+        button_layout.addWidget(self.add_defect_hint)
         
         parent_layout.addLayout(button_layout)
     
@@ -799,7 +1080,7 @@ class DetailDialog(QWidget):
         
         # 统计各个类别的数量
         class_counts = {}
-        modified_counts = {"未修改": 0, "已修改": 0, "待确认": 0}
+        modified_counts = {"未修改": 0, "已修改": 0, "已添加": 0}
         
         for region in self.button.regions:
             # 统计类别
@@ -818,7 +1099,7 @@ class DetailDialog(QWidget):
             elif modified_status == 1:
                 modified_counts["已修改"] += 1
             elif modified_status == 2:
-                modified_counts["待确认"] += 1
+                modified_counts["已添加"] += 1
         
         # 构建显示文本
         stats_text = "类别统计:\n"
@@ -845,7 +1126,7 @@ class DetailDialog(QWidget):
             if modified_status == 1:
                 status_text = " [已修改]"
             elif modified_status == 2:
-                status_text = " [待确认]"
+                status_text = " [已添加]"
             
             # 创建列表项，包含修改状态
             item_text = f"区域 {i+1}: {class_name}{status_text}"
@@ -860,7 +1141,7 @@ class DetailDialog(QWidget):
                 # 已修改：使用黄色调
                 item.setBackground(QColor(255, 255, 0, 100))  # 浅黄色背景
             elif modified_status == 2:
-                # 待确认：使用橙色调
+                # 已添加：使用橙色调
                 item.setBackground(QColor(255, 165, 0, 100))  # 浅橙色背景
             else:
                 # 未修改：使用原来的类别颜色
@@ -888,6 +1169,10 @@ class DetailDialog(QWidget):
             self.load_region_data(region)
             self.current_region_label.setText(f"当前选中: 区域 {region_index + 1}")
             
+            # 启用删除按钮
+            if hasattr(self, 'delete_region_btn'):
+                self.delete_region_btn.setEnabled(True)
+            
             # 高亮显示选中的区域
             if hasattr(self, 'image_label') and self.image_label:
                 self.image_label.set_selected_region(region_index)
@@ -898,6 +1183,48 @@ class DetailDialog(QWidget):
             
             # 更新导航按钮状态
             self.update_navigation_buttons()
+    
+    def on_region_unselected(self):
+        """处理取消选中区域事件"""
+        self.current_region_index = -1
+        self.current_region_label.setText("请点击图片中的区域进行选择")
+        
+        # 禁用删除按钮
+        if hasattr(self, 'delete_region_btn'):
+            self.delete_region_btn.setEnabled(False)
+        
+        # 取消高亮显示选中的区域
+        if hasattr(self, 'image_label') and self.image_label:
+            self.image_label.set_selected_region(-1)
+        
+        # 取消列表中的选中项
+        if hasattr(self, 'region_list_widget'):
+            self.region_list_widget.clearSelection()
+        
+        # 清空编辑控件
+        self.clear_edit_controls()
+        
+        # 更新导航按钮状态
+        self.update_navigation_buttons()
+    
+    def clear_edit_controls(self):
+        """清空编辑控件"""
+        # 重置类别选择
+        if hasattr(self, 'class_combo'):
+            self.class_combo.setCurrentIndex(0)
+        
+        # 重置修改状态
+        if hasattr(self, 'modify_spin'):
+            self.modify_spin.setValue(0)
+        
+        # 清空大小信息
+        if hasattr(self, 'width_label') and hasattr(self, 'height_label'):
+            self.width_label.setText("0")
+            self.height_label.setText("0")
+        
+        # 清空置信度信息
+        if hasattr(self, 'confidence_text'):
+            self.confidence_text.setPlainText("")
     
     def update_navigation_buttons(self):
         """更新导航按钮的状态"""
@@ -911,6 +1238,13 @@ class DetailDialog(QWidget):
             # 下一个按钮：当前不是最后一个区域时启用
             self.next_region_btn.setEnabled(current_index < total_regions - 1 and total_regions > 0)
             
+            # 快速确认按钮：有选中区域时启用
+            self.quick_confirm_btn.setEnabled(current_index >= 0)
+            
+            # 删除按钮：有选中区域时启用
+            if hasattr(self, 'delete_region_btn'):
+                self.delete_region_btn.setEnabled(current_index >= 0)
+
             # 更新按钮文本显示当前位置
             if total_regions > 0 and current_index >= 0:
                 self.prev_region_btn.setText(f"上一个 (←) {current_index}/{total_regions}")
@@ -937,20 +1271,204 @@ class DetailDialog(QWidget):
             if hasattr(self, 'image_label') and self.image_label:
                 self.image_label.focus_on_region(new_index)
     
+    def delete_current_region(self):
+        """删除当前选中的区域"""
+        if self.current_region_index < 0 or self.current_region_index >= len(self.button.regions):
+            QMessageBox.warning(self, "删除失败", "请先选择要删除的区域")
+            return
+        
+        # 确认删除
+        region = self.button.regions[self.current_region_index]
+        class_id = self.get_region_class_id(region)
+        class_name = self.class_manager.get_class_name(class_id)
+        
+        reply = QMessageBox.question(
+            self, "确认删除", 
+            f"确定要删除区域 {self.current_region_index + 1}: {class_name} 吗？\n\n"
+            "注意：删除后需要保存才能永久生效。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+        
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        
+        try:
+            # 删除区域
+            deleted_region = self.button.regions.pop(self.current_region_index)
+            self.regions_modified = True
+            
+            # 更新界面
+            self.update_region_list()
+            self.update_class_statistics()
+            self.update_basic_info()
+            
+            # 重新设置图片和区域
+            if hasattr(self, 'image_label') and self.image_label:
+                self.image_label.set_image_and_regions(
+                    self.actual_img_path, 
+                    self.button.regions, 
+                    self.class_manager
+                )
+            
+            # 选择新的区域（如果还有区域的话）
+            if self.button.regions:
+                if self.current_region_index >= len(self.button.regions):
+                    # 如果删除的是最后一个区域，选择新的最后一个
+                    new_index = len(self.button.regions) - 1
+                else:
+                    # 保持当前索引，选择下一个区域
+                    new_index = self.current_region_index
+                
+                self.on_region_clicked(new_index)
+                if hasattr(self, 'image_label') and self.image_label:
+                    self.image_label.focus_on_region(new_index)
+            else:
+                # 如果没有区域了，清空选择
+                self.current_region_index = -1
+                self.current_region_label.setText("所有区域已删除")
+                self.delete_region_btn.setEnabled(False)
+                self.quick_confirm_btn.setEnabled(False)
+                
+                # 清空编辑控件
+                self.class_combo.setCurrentIndex(0)
+                self.modify_spin.setValue(0)
+                self.width_label.setText("0")
+                self.height_label.setText("0")
+                self.confidence_text.clear()
+            
+            # 更新导航按钮状态
+            self.update_navigation_buttons()
+            
+            QMessageBox.information(self, "删除成功", f"区域 {class_name} 已删除")
+            
+        except Exception as e:
+            QMessageBox.critical(self, "删除失败", f"删除区域时发生错误：\n{str(e)}")
+            print(f"删除区域错误: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def toggle_add_defect_mode(self):
+        """切换添加缺陷模式"""
+        self.add_defect_mode = not self.add_defect_mode
+        
+        if self.add_defect_mode:
+            self.add_defect_btn.setText("退出添加模式")
+            self.add_defect_btn.setStyleSheet("QPushButton { background-color: #795548; color: white; }")
+            self.add_defect_hint.setVisible(True)
+            # 设置图片标签为添加模式
+            if hasattr(self, 'image_label') and self.image_label:
+                self.image_label.set_add_defect_mode(True)
+        else:
+            self.add_defect_btn.setText("添加缺陷")
+            self.add_defect_btn.setStyleSheet("QPushButton { background-color: #FF5722; color: white; }")
+            self.add_defect_hint.setVisible(False)
+            # 退出添加模式
+            if hasattr(self, 'image_label') and self.image_label:
+                self.image_label.set_add_defect_mode(False)
+
+    def add_new_defect_region(self, x, y, width, height):
+        """添加新的缺陷区域"""
+        try:
+            # 将屏幕坐标转换为原始图片坐标
+            if hasattr(self, 'image_label') and self.image_label:
+                original_x = int(x / self.image_label.scale_factor)
+                original_y = int(y / self.image_label.scale_factor)
+                original_width = int(width / self.image_label.scale_factor)
+                original_height = int(height / self.image_label.scale_factor)
+            else:
+                original_x, original_y = x, y
+                original_width, original_height = width, height
+            
+            # 创建新的区域字典
+            new_region = {
+                "final_label_index": 1,  # 设为1
+                "height": original_height,
+                "imgPath": "",  # 设为空字符串
+                "isSure": True,  # 设为True
+                "label_confidence": [
+                    {
+                        "confidence": 1.0,
+                        "label": 11  # 非缺陷
+                    },
+                    {
+                        "confidence": 1.0,
+                        "label": 1  # 用户可以设置的标签，默认为1（大糙）
+                    },
+                    {
+                        "confidence": 1.0,
+                        "label": 11  # 保持一致性
+                    },
+                    {
+                        "confidence": 1.0,
+                        "label": 11  # 保持一致性
+                    }
+                ],
+                "modified_status": 2,  # 设为2，表示人工添加
+                "width": original_width,
+                "x": original_x,
+                "y": original_y,
+                "yolo_confidence": 0.0  # 设为0.0
+            }
+            
+            # 添加到区域列表
+            self.button.regions.append(new_region)
+            self.regions_modified = True
+            
+            # 更新界面
+            self.update_region_list()
+            self.update_class_statistics()
+            self.update_basic_info()
+            
+            # 重新设置图片和区域
+            if hasattr(self, 'image_label') and self.image_label:
+                self.image_label.set_image_and_regions(
+                    self.actual_img_path, 
+                    self.button.regions, 
+                    self.class_manager
+                )
+            
+            # 选择新添加的区域
+            new_index = len(self.button.regions) - 1
+            self.on_region_clicked(new_index)
+            if hasattr(self, 'image_label') and self.image_label:
+                self.image_label.focus_on_region(new_index)
+            
+            # 退出添加模式
+            self.toggle_add_defect_mode()
+            
+            QMessageBox.information(self, "添加成功", "新的缺陷区域已添加！\n请在右侧面板设置正确的类别。")
+            
+        except Exception as e:
+            QMessageBox.critical(self, "添加失败", f"添加缺陷区域时发生错误：\n{str(e)}")
+            print(f"添加缺陷区域错误: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def update_basic_info(self):
+        """更新基本信息显示"""
+        info_text = f"按钮: {self.button.button_name}\n"
+        info_text += f"列号: {self.button.column}\n"
+        info_text += f"索引: {self.button.index}\n"
+        info_text += f"缺陷区域: {len(self.button.regions)} 个"
+        
+        self.basic_info_label.setText(info_text)
+
     def quick_confirm_current_region(self):
         """快速确认当前区域（设置为已修改状态）"""
         if self.current_region_index >= 0 and self.current_region_index < len(self.button.regions):
             region = self.button.regions[self.current_region_index]
             
-            # 设置为已修改状态
-            region['modified_status'] = 1
-            self.regions_modified = True
-            
-            # 更新界面显示
-            self.modify_spin.setValue(1)
-            self.update_region_list()
-            if hasattr(self, 'image_label') and self.image_label:
-                self.image_label.update_display()
+            # 只有在不是人工添加的区域时才设置为已修改状态
+            if region.get('modified_status', 0) != 2:
+                region['modified_status'] = 1
+                self.regions_modified = True
+                
+                # 更新界面显示
+                self.modify_spin.setValue(1)
+                self.update_region_list()
+                if hasattr(self, 'image_label') and self.image_label:
+                    self.image_label.update_display()
             
             # 自动跳转到下一个区域（如果有的话）
             if self.current_region_index < len(self.button.regions) - 1:
@@ -964,21 +1482,28 @@ class DetailDialog(QWidget):
         # 获取正确的类别ID
         class_id = self.get_region_class_id(region)
         
-        # 设置类别
+        # 设置类别（使用标志防止触发on_class_changed）
+        self._updating_class_selection = True
         for i in range(self.class_combo.count()):
             if self.class_combo.itemData(i) == class_id:
                 self.class_combo.setCurrentIndex(i)
                 break
+        delattr(self, '_updating_class_selection')
         
         
-        # 设置修改状态
+        # 设置修改状态（使用标志防止触发on_modify_changed）
+        self._updating_modify_status = True
         self.modify_spin.setValue(region.get('modified_status', 0))
+        delattr(self, '_updating_modify_status')
         
-        # 设置位置信息
-        self.x_label.setText(str(region.get('x', 0)))
-        self.y_label.setText(str(region.get('y', 0)))
-        self.width_label.setText(str(region.get('width', 0)))
-        self.height_label.setText(str(region.get('height', 0)))
+        # 设置大小信息（转换为毫米）
+        width_pixels = region.get('width', 0)
+        height_pixels = region.get('height', 0)
+        width_mm = width_pixels * PER_PIXEL_MM
+        height_mm = height_pixels * PER_PIXEL_MM
+        
+        self.width_label.setText(f"{width_mm:.2f}")
+        self.height_label.setText(f"{height_mm:.2f}")
         
         # 设置置信度信息
         conf_text = f"YOLO置信度: {region.get('yolo_confidence', 0.0):.4f}\n\n"
@@ -1001,6 +1526,10 @@ class DetailDialog(QWidget):
     def on_class_changed(self):
         """处理类别改变事件"""
         if self.current_region_index >= 0:
+            # 只有在用户手动更改时才允许修改（防止自动设置被覆盖）
+            if hasattr(self, '_updating_class_selection'):
+                return
+                
             new_class_id = self.class_combo.currentData()
             region = self.button.regions[self.current_region_index]
             
@@ -1013,13 +1542,14 @@ class DetailDialog(QWidget):
                 # 修改对应项的label值
                 label_confidence[final_label_index]['label'] = new_class_id
                 
-                # 自动设置modified_status为1（表示已修改）
-                region['modified_status'] = 1
-                
-                # 更新修改状态显示（使用标志防止触发on_modify_changed）
-                self._updating_modify_status = True
-                self.modify_spin.setValue(1)
-                delattr(self, '_updating_modify_status')
+                # 只有在不是人工添加的区域时才自动设置modified_status为1
+                if region.get('modified_status', 0) != 2:
+                    region['modified_status'] = 1
+                    
+                    # 更新修改状态显示（使用标志防止触发on_modify_changed）
+                    self._updating_modify_status = True
+                    self.modify_spin.setValue(1)
+                    delattr(self, '_updating_modify_status')
                 
                 self.regions_modified = True
                 self.update_region_list()
@@ -1079,12 +1609,15 @@ class DetailDialog(QWidget):
         elif event.key() == Qt.Key.Key_Space:
             # 空格键：快速确认当前区域（将修改状态设为1）
             if self.current_region_index >= 0:
-                self.button.regions[self.current_region_index]['modified_status'] = 1
-                self.regions_modified = True
-                self.load_region_data(self.button.regions[self.current_region_index])
-                self.update_region_list()
-                self.update_class_statistics()
-                self.image_label.update_display()
+                region = self.button.regions[self.current_region_index]
+                # 只有在不是人工添加的区域时才设置为已修改状态
+                if region.get('modified_status', 0) != 2:
+                    region['modified_status'] = 1
+                    self.regions_modified = True
+                    self.load_region_data(region)
+                    self.update_region_list()
+                    self.update_class_statistics()
+                    self.image_label.update_display()
         else:
             super().keyPressEvent(event)
     
@@ -1120,6 +1653,10 @@ class DetailDialog(QWidget):
         elif event.key() == Qt.Key.Key_Space:
             # 空格键：快速确认当前区域
             self.quick_confirm_current_region()
+        elif event.key() == Qt.Key.Key_Delete or event.key() == Qt.Key.Key_Backspace:
+            # Delete键或Backspace键：删除当前区域
+            if self.current_region_index >= 0:
+                self.delete_current_region()
         elif event.key() == Qt.Key.Key_Escape:
             # ESC键：关闭窗口
             self.close()
@@ -1127,33 +1664,94 @@ class DetailDialog(QWidget):
             super().keyPressEvent(event)
     
     def zoom_in(self):
-        """放大图片"""
+        """放大图片，以视窗中心为中心"""
         if hasattr(self, 'image_label') and self.image_label:
-            self.image_label.zoom_factor *= 1.2
-            self.image_label.zoom_factor = min(5.0, self.image_label.zoom_factor)
-            self.image_label.update_display()
-            self.update_zoom_label()
+            self._zoom_with_center(1.2)
     
     def zoom_out(self):
-        """缩小图片"""
+        """缩小图片，以视窗中心为中心"""
         if hasattr(self, 'image_label') and self.image_label:
-            self.image_label.zoom_factor *= 0.8
-            self.image_label.zoom_factor = max(0.1, self.image_label.zoom_factor)
-            self.image_label.update_display()
-            self.update_zoom_label()
+            self._zoom_with_center(0.8)
+    
+    def _zoom_with_center(self, zoom_multiplier):
+        """以视窗中心为中心进行缩放"""
+        if not hasattr(self, 'image_label') or not self.image_label or not self.image_label.scroll_area:
+            return
+        
+        # 获取滚动区域
+        scroll_area = self.image_label.scroll_area
+        
+        # 获取视窗中心点
+        viewport = scroll_area.viewport()
+        center_x = viewport.width() / 2
+        center_y = viewport.height() / 2
+        
+        # 获取滚动条位置
+        h_scrollbar = scroll_area.horizontalScrollBar()
+        v_scrollbar = scroll_area.verticalScrollBar()
+        old_h_value = h_scrollbar.value()
+        old_v_value = v_scrollbar.value()
+        
+        # 计算视窗中心在图片中的相对位置
+        old_size = self.image_label.size()
+        if old_size.width() > 0 and old_size.height() > 0:
+            rel_x = (center_x + old_h_value) / old_size.width()
+            rel_y = (center_y + old_v_value) / old_size.height()
+        else:
+            rel_x = 0.5
+            rel_y = 0.5
+        
+        # 执行缩放
+        old_zoom = self.image_label.zoom_factor
+        self.image_label.zoom_factor *= zoom_multiplier
+        self.image_label.zoom_factor = max(0.1, min(5.0, self.image_label.zoom_factor))
+        
+        # 更新显示
+        self.image_label.update_display()
+        self.update_zoom_label()
+        
+        # 计算新的滚动位置以保持视窗中心为缩放中心
+        new_size = self.image_label.size()
+        new_h_value = rel_x * new_size.width() - center_x
+        new_v_value = rel_y * new_size.height() - center_y
+        
+        # 设置新的滚动位置
+        h_scrollbar.setValue(int(new_h_value))
+        v_scrollbar.setValue(int(new_v_value))
     
     def zoom_reset(self):
-        """重置缩放"""
+        """重置缩放，以视窗中心为中心"""
         if hasattr(self, 'image_label') and self.image_label:
-            self.image_label.zoom_factor = 1.0
-            self.image_label.update_display()
-            self.update_zoom_label()
+            # 如果当前已经是100%，直接返回
+            if abs(self.image_label.zoom_factor - 1.0) < 0.01:
+                return
+            
+            # 计算缩放倍数
+            reset_multiplier = 1.0 / self.image_label.zoom_factor
+            self._zoom_with_center(reset_multiplier)
     
     def update_zoom_label(self):
         """更新缩放标签"""
         if hasattr(self, 'image_label') and self.image_label and hasattr(self, 'zoom_label'):
             zoom_percent = int(self.image_label.zoom_factor * 100)
             self.zoom_label.setText(f"缩放: {zoom_percent}%")
+    
+    def toggle_regions_visibility(self):
+        """切换区域框的显示/隐藏"""
+        self.regions_visible = not self.regions_visible
+        
+        # 更新按钮文本
+        if self.regions_visible:
+            self.toggle_regions_btn.setText("隐藏区域框")
+            self.toggle_regions_btn.setStyleSheet("QPushButton { background-color: #FF9800; color: white; }")
+        else:
+            self.toggle_regions_btn.setText("显示区域框")
+            self.toggle_regions_btn.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; }")
+        
+        # 更新图片显示
+        if hasattr(self, 'image_label') and self.image_label:
+            self.image_label.regions_visible = self.regions_visible
+            self.image_label.update_display()
 
 
 class ImageButton(QPushButton):
@@ -1167,10 +1765,13 @@ class ImageButton(QPushButton):
         self.column = pic_info.get('column', 0)
         self.index = pic_info.get('index', 0)
         
+        # 计算洁净度区域数量
+        cleanliness_count = self.count_cleanliness_regions()
+        
         # 设置按钮文本和样式
-        self.setText(f"{button_name}\n区域: {len(self.regions)}")
-        self.setMinimumSize(80, 60)
-        self.setMaximumSize(120, 80)
+        self.setText(f"{button_name}\n区域: {len(self.regions)}\n洁净度: {cleanliness_count}")
+        self.setMinimumSize(80, 80)  # 增加高度以容纳更多文本
+        self.setMaximumSize(120, 100)
         
         # 根据是否有缺陷区域设置不同颜色
         if self.regions:
@@ -1203,6 +1804,36 @@ class ImageButton(QPushButton):
                     background-color: #33ff33;
                 }
             """)
+    
+    def get_region_class_id(self, region):
+        """从区域数据中获取正确的类别ID"""
+        try:
+            final_label_index = region.get('final_label_index', 0)
+            label_confidence = region.get('label_confidence', [])
+            
+            # 检查索引是否有效
+            if 0 <= final_label_index < len(label_confidence):
+                return label_confidence[final_label_index].get('label', 11)
+            else:
+                # 如果索引无效，返回默认值或第一个标签
+                if label_confidence:
+                    return label_confidence[0].get('label', 11)
+                return 11  # 默认为"非缺陷"
+        except (IndexError, TypeError):
+            return 11  # 出错时返回默认值
+    
+    def count_cleanliness_regions(self):
+        """计算洁净度（label为10）的区域数量"""
+        if not self.regions:
+            return 0
+        
+        cleanliness_count = 0
+        for region in self.regions:
+            class_id = self.get_region_class_id(region)
+            if class_id == 10:  # 洁净度的label为10
+                cleanliness_count += 1
+        
+        return cleanliness_count
 
 
 class BoardView(QWidget):
@@ -1424,7 +2055,7 @@ class SilkLabelApp(QMainWindow):
     
     def init_ui(self):
         """初始化用户界面"""
-        self.setWindowTitle("SilkLabel - 丝网缺陷标注工具")
+        self.setWindowTitle("SilkLabel - 生丝缺陷标注工具")
         self.setGeometry(100, 100, 1000, 700)
         
         # 创建中央widget
