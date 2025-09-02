@@ -100,6 +100,18 @@ class ImageLabel(QLabel):
         self.scroll_area = None  # 滚动区域的引用
         self.click_threshold = 5  # 点击和拖动的阈值（像素）
         
+    def clear_image_cache(self):
+        """清除图片缓存"""
+        self.original_pixmap = None
+        self.regions = []
+        self.selected_region_index = -1
+        self.zoom_factor = 1.0
+        self.scale_factor = 1.0
+        self.image_path = None
+        self.clear()  # 清除QLabel显示的内容
+        self.setText("无图片")
+        print("图片缓存已清除")
+        
     def set_image_and_regions(self, image_path, regions, class_manager):
         """设置图片和缺陷区域"""
         try:
@@ -942,7 +954,7 @@ class DetailDialog(QWidget):
         nav_layout.addLayout(nav_button_layout)
         
         # 添加快捷键提示
-        shortcut_label = QLabel("快捷键: ←/→ 方向键导航, 空格键快速确认, Delete键删除, 右键拖拽添加缺陷, 左键拖动移动图片")
+        shortcut_label = QLabel("快捷键: ←/→ 方向键导航, 空格键快速确认, Delete键删除, H键隐藏/显示区域框, 右键拖拽添加缺陷, 左键拖动移动图片")
         shortcut_label.setStyleSheet("color: gray; font-size: 9px;")
         nav_layout.addWidget(shortcut_label)
         
@@ -1589,6 +1601,11 @@ class DetailDialog(QWidget):
                     # 保存到JSON文件
                     if hasattr(self.parent_app, 'save_json_data'):
                         self.parent_app.save_json_data()
+                        
+                        # 及时刷新按钮上的洁净度数量
+                        if hasattr(self.parent_app, 'refresh_button_display'):
+                            self.parent_app.refresh_button_display(self.button)
+                        
                         QMessageBox.information(self, "保存成功", "修改已保存到JSON文件！")
                         self.regions_modified = False
                     else:
@@ -1636,11 +1653,23 @@ class DetailDialog(QWidget):
                 self.save_changes()
                 event.accept()
             elif reply == QMessageBox.StandardButton.Discard:
+                # 即使不保存，也需要刷新按钮显示以确保状态正确
+                if hasattr(self.parent_app, 'refresh_button_display'):
+                    self.parent_app.refresh_button_display(self.button)
                 event.accept()
             else:
                 event.ignore()
+                return
         else:
+            # 即使没有修改，也刷新按钮显示以确保状态正确
+            if hasattr(self.parent_app, 'refresh_button_display'):
+                self.parent_app.refresh_button_display(self.button)
             event.accept()
+        
+        # 清理父应用的引用
+        if hasattr(self, 'parent_app') and self.parent_app:
+            if hasattr(self.parent_app, 'detail_dialog'):
+                self.parent_app.detail_dialog = None
     
     def keyPressEvent(self, event):
         """处理键盘快捷键"""
@@ -1657,6 +1686,9 @@ class DetailDialog(QWidget):
             # Delete键或Backspace键：删除当前区域
             if self.current_region_index >= 0:
                 self.delete_current_region()
+        elif event.key() == Qt.Key.Key_H:
+            # H键：切换区域框显示/隐藏
+            self.toggle_regions_visibility()
         elif event.key() == Qt.Key.Key_Escape:
             # ESC键：关闭窗口
             self.close()
@@ -1768,19 +1800,45 @@ class ImageButton(QPushButton):
         # 计算洁净度区域数量
         cleanliness_count = self.count_cleanliness_regions()
         
-        # 设置按钮文本和样式
-        self.setText(f"{button_name}\n区域: {len(self.regions)}\n洁净度: {cleanliness_count}")
-        self.setMinimumSize(80, 80)  # 增加高度以容纳更多文本
-        self.setMaximumSize(120, 100)
+        # 检查确认状态
+        confirmation_status = self.check_confirmation_status()
         
-        # 根据是否有缺陷区域设置不同颜色
-        if self.regions:
+        # 设置按钮文本和样式，包含确认状态
+        confirmation_text = ""
+        if confirmation_status["total"] > 0:
+            confirmation_text = f"\n确认: {confirmation_status['confirmed']}/{confirmation_status['total']}"
+        
+        self.setText(f"{button_name}\n区域: {len(self.regions)}\n洁净度: {cleanliness_count}{confirmation_text}")
+        self.setMinimumSize(80, 100)  # 增加高度以容纳更多文本
+        self.setMaximumSize(120, 120)
+        
+        # 根据确认状态设置不同颜色
+        if confirmation_status["total"] > 0 and confirmation_status["unconfirmed"] > 0:
+            # 有未确认的区域 - 使用橙色警告色
+            self.setStyleSheet("""
+                QPushButton {
+                    background-color: #ffcc99;
+                    border: 2px solid #ff9933;
+                    border-radius: 5px;
+                    font-size: 9px;
+                    color: #cc3300;
+                    font-weight: bold;
+                }
+                QPushButton:hover {
+                    background-color: #ffaa66;
+                }
+                QPushButton:pressed {
+                    background-color: #ff7700;
+                }
+            """)
+        elif self.regions:
+            # 有缺陷区域且已全部确认 - 使用红色
             self.setStyleSheet("""
                 QPushButton {
                     background-color: #ffcccc;
                     border: 2px solid #ff6666;
                     border-radius: 5px;
-                    font-size: 10px;
+                    font-size: 9px;
                 }
                 QPushButton:hover {
                     background-color: #ff9999;
@@ -1790,12 +1848,13 @@ class ImageButton(QPushButton):
                 }
             """)
         else:
+            # 无缺陷区域 - 使用绿色
             self.setStyleSheet("""
                 QPushButton {
                     background-color: #ccffcc;
                     border: 2px solid #66cc66;
                     border-radius: 5px;
-                    font-size: 10px;
+                    font-size: 9px;
                 }
                 QPushButton:hover {
                     background-color: #99ff99;
@@ -1834,6 +1893,24 @@ class ImageButton(QPushButton):
                 cleanliness_count += 1
         
         return cleanliness_count
+    
+    def check_confirmation_status(self):
+        """检查所有区域的确认状态"""
+        if not self.regions:
+            return {"total": 0, "confirmed": 0, "unconfirmed": 0}
+        
+        total = len(self.regions)
+        confirmed = 0
+        unconfirmed = 0
+        
+        for region in self.regions:
+            modified_status = region.get('modified_status', 0)
+            if modified_status > 0:  # 已修改或已添加表示已确认
+                confirmed += 1
+            else:
+                unconfirmed += 1
+        
+        return {"total": total, "confirmed": confirmed, "unconfirmed": unconfirmed}
 
 
 class BoardView(QWidget):
@@ -2144,21 +2221,94 @@ class SilkLabelApp(QMainWindow):
         except Exception as e:
             raise Exception(f"保存JSON文件失败: {str(e)}")
     
-    def clear_content(self):
-        """清空显示内容"""
-        self.file_path_label.setText("未选择文件")
-        self.file_path_label.setStyleSheet("QLabel { color: gray; font-style: italic; }")
-        self.batch_info_label.setText("")
-        self.clear_btn.setEnabled(False)
-        self.selected_file_path = None
-        self.json_data = None
-        self.current_board_data = None
+    def refresh_button_display(self, updated_button):
+        """刷新指定按钮的显示（洁净度数量等）"""
+        try:
+            # 重新计算洁净度区域数量
+            cleanliness_count = updated_button.count_cleanliness_regions()
+            
+            # 检查确认状态
+            confirmation_status = updated_button.check_confirmation_status()
+            
+            # 更新按钮文本，包含确认状态
+            confirmation_text = ""
+            if confirmation_status["total"] > 0:
+                confirmation_text = f"\n确认: {confirmation_status['confirmed']}/{confirmation_status['total']}"
+            
+            updated_button.setText(f"{updated_button.button_name}\n区域: {len(updated_button.regions)}\n洁净度: {cleanliness_count}{confirmation_text}")
+            
+            # 根据确认状态重新设置按钮样式
+            if confirmation_status["total"] > 0 and confirmation_status["unconfirmed"] > 0:
+                # 有未确认的区域 - 使用橙色警告色
+                updated_button.setStyleSheet("""
+                    QPushButton {
+                        background-color: #ffcc99;
+                        border: 2px solid #ff9933;
+                        border-radius: 5px;
+                        font-size: 9px;
+                        color: #cc3300;
+                        font-weight: bold;
+                    }
+                    QPushButton:hover {
+                        background-color: #ffaa66;
+                    }
+                    QPushButton:pressed {
+                        background-color: #ff7700;
+                    }
+                """)
+            elif updated_button.regions:
+                # 有缺陷区域且已全部确认 - 使用红色
+                updated_button.setStyleSheet("""
+                    QPushButton {
+                        background-color: #ffcccc;
+                        border: 2px solid #ff6666;
+                        border-radius: 5px;
+                        font-size: 9px;
+                    }
+                    QPushButton:hover {
+                        background-color: #ff9999;
+                    }
+                    QPushButton:pressed {
+                        background-color: #ff3333;
+                    }
+                """)
+            else:
+                # 无缺陷区域 - 使用绿色
+                updated_button.setStyleSheet("""
+                    QPushButton {
+                        background-color: #ccffcc;
+                        border: 2px solid #66cc66;
+                        border-radius: 5px;
+                        font-size: 9px;
+                    }
+                    QPushButton:hover {
+                        background-color: #99ff99;
+                    }
+                    QPushButton:pressed {
+                        background-color: #33ff33;
+                    }
+                """)
+            
+            print(f"已刷新按钮 {updated_button.button_name} 的显示")
+            
+        except Exception as e:
+            print(f"刷新按钮显示时出错: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def select_json_file(self):
+        """选择JSON文件"""
+        file_dialog = QFileDialog()
+        file_path, _ = file_dialog.getOpenFileName(
+            self,
+            "选择JSON文件",
+            "",
+            "JSON文件 (*.json);;所有文件 (*.*)"
+        )
         
-        # 清空按钮视图
-        self.front_view.clear_buttons()
-        self.back_view.clear_buttons()
-        
-        self.status_label.setText("内容已清空")
+        if file_path:
+            self.selected_file_path = file_path
+            self.load_json_file(file_path)
     
     def select_json_file(self):
         """选择JSON文件"""
@@ -2177,141 +2327,24 @@ class SilkLabelApp(QMainWindow):
     def load_json_file(self, file_path):
         """加载并显示JSON文件内容"""
         try:
-            with open(file_path, 'r', encoding='utf-8') as file:
-                self.json_data = json.load(file)
-            
-            # 更新界面状态
-            self.file_path_label.setText(f"文件路径: {file_path}")
-            self.file_path_label.setStyleSheet("QLabel { color: black; }")
-            self.clear_btn.setEnabled(True)
-            
-            # 处理黑板数据
-            self.process_board_data()
-            
-            self.status_label.setText(f"成功加载文件: {file_path}")
-            
-        except json.JSONDecodeError as e:
-            QMessageBox.warning(
-                self,
-                "JSON解析错误",
-                f"文件不是有效的JSON格式:\n{str(e)}"
-            )
-            self.status_label.setText("JSON解析失败")
-            
-        except FileNotFoundError:
-            QMessageBox.critical(
-                self,
-                "文件错误",
-                "找不到指定的文件!"
-            )
-            self.status_label.setText("文件未找到")
-            
-        except Exception as e:
-            QMessageBox.critical(
-                self,
-                "错误",
-                f"加载文件时发生错误:\n{str(e)}"
-            )
-            self.status_label.setText("加载文件失败")
-    
-    def process_board_data(self):
-        """处理黑板数据并生成按钮"""
-        if not self.json_data:
-            return
-        
-        try:
-            # 获取批次名称
-            batch_name = self.json_data.get('batchName', '未知批次')
-            self.batch_info_label.setText(f"批次: {batch_name}")
-            
-            # 获取当前黑板数据
-            self.current_board_data = self.json_data.get('currentBlackboard')
-            if not self.current_board_data:
-                QMessageBox.warning(self, "数据错误", "JSON文件中没有找到currentBlackboard数据")
-                return
-            
-            all_pic_info = self.current_board_data.get('all_pic_info', [])
-            if not all_pic_info:
-                QMessageBox.warning(self, "数据错误", "JSON文件中没有找到图片信息")
-                return
-            
-            # 分离正面和反面图片
-            front_pics = []  # 正面：1_1到1_25 + 2_1到2_25
-            back_pics = []   # 反面：1_26到1_50 + 2_26到2_50
-            
-            for pic_info in all_pic_info:
-                button_name = pic_info.get('connectButtonName', '')
-                
-                # 解析按钮名称，如 "p1_1" 或 "p2_26"
-                if button_name.startswith('p1_'):
-                    # 第1个相机
-                    try:
-                        number = int(button_name.split('_')[1])
-                        if 1 <= number <= 25:
-                            front_pics.append(pic_info)
-                        elif 26 <= number <= 50:
-                            back_pics.append(pic_info)
-                    except (ValueError, IndexError):
-                        pass
-                elif button_name.startswith('p2_'):
-                    # 第2个相机
-                    try:
-                        number = int(button_name.split('_')[1])
-                        if 1 <= number <= 25:
-                            front_pics.append(pic_info)
-                        elif 26 <= number <= 50:
-                            back_pics.append(pic_info)
-                    except (ValueError, IndexError):
-                        pass
-            
-            # 按照相机和编号排序
-            def sort_key(pic_info):
+            # 先清理旧数据
+            if hasattr(self, 'detail_dialog') and self.detail_dialog:
                 try:
-                    button_name = pic_info.get('connectButtonName', '')
-                    parts = button_name.split('_')
-                    if len(parts) >= 2:
-                        camera = int(parts[0][1:])  # p1 -> 1, p2 -> 2
-                        number = int(parts[1])
-                        return (camera, number)
-                    return (0, 0)
-                except (ValueError, IndexError):
-                    return (0, 0)
+                    self.detail_dialog.close()
+                except RuntimeError:
+                    # 对象已经被删除，忽略错误
+                    pass
+                self.detail_dialog = None
             
-            front_pics.sort(key=sort_key)
-            back_pics.sort(key=sort_key)
+            # 清空旧的按钮视图
+            self.front_view.clear_buttons()
+            self.back_view.clear_buttons()
             
-            # 生成按钮
-            self.front_view.add_buttons(front_pics)
-            self.back_view.add_buttons(back_pics)
-            
-            self.status_label.setText(f"已加载 {len(front_pics)} 张正面图片和 {len(back_pics)} 张反面图片")
-            
-        except Exception as e:
-            QMessageBox.critical(
-                self,
-                "处理数据错误",
-                f"处理黑板数据时发生错误:\n{str(e)}"
-            )
-    
-    def select_json_file(self):
-        """选择JSON文件"""
-        file_dialog = QFileDialog()
-        file_path, _ = file_dialog.getOpenFileName(
-            self,
-            "选择JSON文件",
-            "",
-            "JSON文件 (*.json);;所有文件 (*.*)"
-        )
-        
-        if file_path:
-            self.selected_file_path = file_path
-            self.load_json_file(file_path)
-    
-    def load_json_file(self, file_path):
-        """加载并显示JSON文件内容"""
-        try:
             with open(file_path, 'r', encoding='utf-8') as file:
                 self.json_data = json.load(file)
+            
+            # 设置JSON文件所在目录
+            self.json_dir = os.path.dirname(file_path)
             
             # 更新界面状态
             self.file_path_label.setText(f"文件路径: {file_path}")
@@ -2469,12 +2502,22 @@ class SilkLabelApp(QMainWindow):
         self.selected_file_path = None
         self.json_data = None
         self.current_board_data = None
+        self.json_dir = None  # 清除JSON目录
+        
+        # 关闭当前打开的详细标注窗口
+        if hasattr(self, 'detail_dialog') and self.detail_dialog:
+            try:
+                self.detail_dialog.close()
+            except RuntimeError:
+                # 对象已经被删除，忽略错误
+                pass
+            self.detail_dialog = None
         
         # 清空按钮视图
         self.front_view.clear_buttons()
         self.back_view.clear_buttons()
         
-        self.status_label.setText("内容已清空")
+        self.status_label.setText("内容已清空，图片缓存已清理")
 
 
 def main():
